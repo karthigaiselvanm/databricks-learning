@@ -1,0 +1,42 @@
+name: databricks-notebook-check
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  databricks-notebook-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Run smoke notebook on Databricks (AWS/GCP)
+        uses: databricks/run-notebook@v0
+        with:
+          databricks-host: ${{ secrets.DATABRICKS_HOST }}
+          databricks-token: ${{ secrets.DATABRICKS_TOKEN }}
+
+          # Run a notebook from THIS repo (adjust path)
+          local-notebook-path: notebooks/smoke_test
+
+          # Use the PR's head commit when available
+          git-commit: ${{ github.event.pull_request.head.sha || github.sha }}
+
+          # EITHER spin up a small ephemeral cluster...
+          new-cluster-json: >
+            {
+              "num_workers": 1,
+              "spark_version": "11.3.x-scala2.12",
+              "node_type_id": "i3.xlarge"
+            }
+          # ...OR comment out new-cluster-json and use an existing cluster:
+          # existing-cluster-id: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+
+          # Optional: let others view the run
+          access-control-list-json: >
+            [
+              { "group_name": "users", "permission_level": "CAN_VIEW" }
+            ]
