@@ -4,6 +4,7 @@ on:
 jobs:
   updaterepo:
     runs-on: ubuntu-latest
+    environment: dev    # your env where DATABRICKS_HOST / DATABRICKS_TOKEN are stored
     steps:
       - name: Setup Python
         uses: actions/setup-python@v3
