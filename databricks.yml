@@ -1,0 +1,21 @@
+bundle:
+  name: databricks-ci
+
+resources:
+  jobs:
+    run-pr-notebook:
+      name: databricks-run-pr-notebook
+      tasks:
+        - task_key: run-notebook
+          description: Run changed notebook in PR
+          notebook_task:
+            notebook_path: ./src/simple_job/count_sample.ipynb
+            source: WORKSPACE
+targets:
+  development:
+    mode: development
+    default: true
+    workspace:
+      root_path: /Worspace/Users/${workspace.current_user.userName}/GitHub Folders/dev/databricks-learning
+
+      
