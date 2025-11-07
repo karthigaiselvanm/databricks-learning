@@ -1,4 +1,4 @@
-name: databricks-notebook-check
+name: databricks-run-pr-notebook
 
 on:
   pull_request:
@@ -7,23 +7,169 @@ on:
     branches: [ main ]
 
 jobs:
-  databricks-notebook-check:
+  run-pr-notebook:
     runs-on: ubuntu-latest
-    environment: dev            # <-- required to access Secrets placed in Environments -> dev
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    environment: dev    # your env where DATABRICKS_HOST / DATABRICKS_TOKEN are stored
+    timeout-minutes: 30
 
-      - name: Run smoke notebook on Databricks (AWS/GCP)
-        uses: databricks/run-notebook@v0
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
         with:
-          databricks-host: ${{ secrets.DATABRICKS_HOST }}
-          databricks-token: ${{ secrets.DATABRICKS_TOKEN }}
-          local-notebook-path: notebooks/smoke_test
-          git-commit: ${{ github.event.pull_request.head.sha || github.sha }}
-          new-cluster-json: >
-            {
-              "num_workers": 1,
-              "spark_version": "11.3.x-scala2.12",
-              "node_type_id": "i3.xlarge"
-            }
+          fetch-depth: 0
+
+      - name: Find changed notebook under notebooks/
+        id: find_nb
+        run: |
+          set -euo pipefail
+          # Determine PR-aware base ref where available, otherwise use HEAD^
+          if [ -n "${{ github.event.pull_request.head.sha }}" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.sha }}^"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          echo "Base: $BASE_SHA"
+          echo "Head: $HEAD_SHA"
+
+          # List files changed in the PR range (works on PR events and push)
+          changed_files=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" || true)
+          echo "Changed files:"
+          echo "$changed_files"
+
+          # Pick the first file under notebooks/ (adjust pattern if needed)
+          nb_file=$(printf "%s\n" "$changed_files" | grep -E '^notebooks/.*\.(py|ipynb|scala|r|sql)$' | head -n1 || true)
+
+          if [ -z "$nb_file" ]; then
+            echo "No notebook file changed under notebooks/; trying to find any notebooks in repo..."
+            nb_file=$(git ls-files 'notebooks/*' | head -n1 || true)
+          fi
+
+          if [ -z "$nb_file" ]; then
+            echo "No notebook found. Exiting with neutral outcome."
+            echo "::set-output name=found::false"
+            exit 0
+          fi
+
+          echo "Found notebook: $nb_file"
+          echo "::set-output name=found::true"
+          echo "::set-output name=path::$nb_file"
+
+      - name: Import notebook to Databricks workspace and submit run
+        if: steps.find_nb.outputs.found == 'true'
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          set -euo pipefail
+          NB_PATH="${{ steps.find_nb.outputs.path }}"
+          echo "Notebook path in repo: $NB_PATH"
+
+          # Where to import in the workspace - use repo + sha to avoid collisions
+          WORKSPACE_BASE="/Repos/github-actions"
+          REPO_SHA="${{ github.sha }}"
+          TARGET_DIR="${WORKSPACE_BASE}/${REPO_SHA}"
+          # Make target path and filename (Databricks workspace API expects full path including filename)
+          FILENAME=$(basename "$NB_PATH")
+          WORKSPACE_PATH="${TARGET_DIR}/${FILENAME}"
+
+          echo "Workspace target: $WORKSPACE_PATH"
+
+          # Read file and base64-encode for the workspace/import API
+          # Determine import format + language from extension
+          ext="${FILENAME##*.}"
+          if [ "$ext" = "py" ]; then
+            format="SOURCE"
+            language="PYTHON"
+          elif [ "$ext" = "ipynb" ]; then
+            format="JUPYTER"
+            language="PYTHON"
+          elif [ "$ext" = "sql" ]; then
+            format="SOURCE"
+            language="SQL"
+          else
+            format="SOURCE"
+            language="PYTHON"
+          fi
+
+          # Base64 encode content (works for binary or text); use | base64 -w0 on linux
+          content_b64=$(base64 -w0 "$NB_PATH")
+
+          echo "Importing notebook to workspace via /api/2.0/workspace/import ..."
+          import_payload=$(jq -n \
+            --arg path "$WORKSPACE_PATH" \
+            --arg format "$format" \
+            --arg language "$language" \
+            --arg content "$content_b64" \
+            '{path:$path, format:$format, language:$language, content:$content}')
+
+          resp=$(curl -sS -X POST "${DATABRICKS_HOST%/}/api/2.0/workspace/import" \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$import_payload")
+
+          echo "Import response: $resp"
+
+          # Submit run (no cluster specified -> serverless if workspace supports it)
+          submit_payload=$(jq -n \
+            --arg notebook_path "$WORKSPACE_PATH" \
+            '{run_name: "CI - imported PR notebook", notebook_task: { notebook_path: $notebook_path }, timeout_seconds: 1800 }')
+
+          echo "Submitting run via jobs/runs/submit ..."
+          resp2=$(curl -sS -X POST "${DATABRICKS_HOST%/}/api/2.2/jobs/runs/submit" \
+            -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$submit_payload")
+
+          echo "Submit response: $resp2"
+          run_id=$(echo "$resp2" | jq -r '.run_id // empty')
+          if [ -z "$run_id" ]; then
+            echo "Failed to submit run. Response:"
+            echo "$resp2"
+            exit 1
+          fi
+          echo "Submitted run_id=$run_id"
+          echo "::set-output name=run_id::$run_id"
+
+          # Poll the run until terminal
+          echo "Polling run $run_id ..."
+          max_seconds=1800
+          interval=8
+          elapsed=0
+          while true; do
+            r=$(curl -sS -X GET "${DATABRICKS_HOST%/}/api/2.2/jobs/runs/get?run_id=${run_id}" \
+              -H "Authorization: Bearer $DATABRICKS_TOKEN")
+            life_cycle=$(echo "$r" | jq -r '.state.life_cycle_state // empty')
+            result_state=$(echo "$r" | jq -r '.state.result_state // empty')
+            echo "life_cycle=$life_cycle result_state=$result_state"
+
+            if [ "$life_cycle" = "TERMINATED" ] || [ "$life_cycle" = "SKIPPED" ] || [ "$life_cycle" = "INTERNAL_ERROR" ]; then
+              echo "Terminal state reached: $life_cycle / $result_state"
+              out=$(curl -sS -X GET "${DATABRICKS_HOST%/}/api/2.2/jobs/runs/get-output?run_id=${run_id}" \
+                -H "Authorization: Bearer $DATABRICKS_TOKEN" || true)
+              echo "Run output (truncated):"
+              echo "$out" | jq -r '.notebook_output.result // .'
+              if [ "$result_state" = "SUCCESS" ]; then
+                echo "Notebook run succeeded."
+                exit 0
+              else
+                echo "Notebook run failed. Full get-output:"
+                echo "$out"
+                exit 1
+              fi
+            fi
+
+            if [ "$elapsed" -ge "$max_seconds" ]; then
+              echo "Timed out waiting for run"
+              curl -sS -X POST "${DATABRICKS_HOST%/}/api/2.2/jobs/runs/cancel" \
+                -H "Authorization: Bearer $DATABRICKS_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data "{\"run_id\": ${run_id}}" || true
+              exit 2
+            fi
+
+            sleep $interval
+            elapsed=$((elapsed + interval))
+          done
