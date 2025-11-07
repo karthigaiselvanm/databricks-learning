@@ -1,0 +1,21 @@
+on:
+  push
+
+jobs:
+  updaterepo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.8'
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Remote update Prod repo
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          databricks repos update "/Workspace/Users/karthik_gce@yahoo.co.in/GitHub Folders/prod/databricks-learning" --branch prod
